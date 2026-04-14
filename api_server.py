@@ -6,6 +6,7 @@ Shareable API for Centene Kentucky location fetch.
 import base64
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -35,6 +36,10 @@ class InsurancePlanFilterResponse(BaseModel):
     query_mode: str = Field(description="How data was fetched for reliable filtering")
     total_insurance_plans: int = Field(description="Count of InsurancePlan entries returned")
     sources: List[str] = Field(description="Unique meta.source values from entries")
+    skipped_sources: List[str] = Field(
+        default_factory=list,
+        description="Sources skipped due to upstream timeout/error.",
+    )
     entries: Optional[List[Dict[str, Any]]] = Field(
         default=None,
         description="Raw FHIR bundle entries (only included when include_entries=true)",
@@ -61,17 +66,36 @@ def _auth_header() -> str:
 
 
 def _get(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=60)
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Network error while calling Centene API: {exc}") from exc
+    retries = 3
+    backoff_seconds = 1.0
+    last_response: Optional[requests.Response] = None
 
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Centene API returned {response.status_code}: {response.text[:200]}",
-        )
-    return response.json()
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=60)
+            last_response = response
+        except requests.RequestException as exc:
+            if attempt == retries:
+                raise HTTPException(status_code=502, detail=f"Network error while calling Centene API: {exc}") from exc
+            time.sleep(backoff_seconds)
+            backoff_seconds *= 2
+            continue
+
+        if response.status_code == 200:
+            return response.json()
+
+        if response.status_code in (502, 503, 504) and attempt < retries:
+            time.sleep(backoff_seconds)
+            backoff_seconds *= 2
+            continue
+
+        break
+
+    assert last_response is not None
+    raise HTTPException(
+        status_code=502,
+        detail=f"Centene API returned {last_response.status_code}: {last_response.text[:200]}",
+    )
 
 
 def _fetch_all_ky_locations(count_per_page: int = 200, max_pages: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -179,9 +203,9 @@ def fetch_ky_locations(
         description="When true, include full raw entries in response.",
     ),
     max_pages: Optional[int] = Query(
-        default=None,
+        default=1,
         ge=1,
-        description="Optional page limit for faster testing (omit for full fetch).",
+        description="Page limit for reliability in deployment (default 1).",
     ),
 ) -> FetchResponse:
     entries = _fetch_all_ky_locations(max_pages=max_pages)
@@ -221,9 +245,9 @@ def fetch_kentucky_medicaid_insurance_plans(
         description="When true, include full raw entries in response.",
     ),
     max_pages: Optional[int] = Query(
-        default=None,
+        default=1,
         ge=1,
-        description="Optional page limit for faster testing (omit for full fetch).",
+        description="Page limit for reliability in deployment (default 1).",
     ),
 ) -> InsurancePlanFilterResponse:
     validated_name_contains = _validate_filter_value(name_contains, "name:contains")
@@ -238,8 +262,15 @@ def fetch_kentucky_medicaid_insurance_plans(
     }
 
     pooled_entries: List[Dict[str, Any]] = []
+    skipped_sources: List[str] = []
     for source in sorted(ky_sources):
-        pooled_entries.extend(_fetch_insurance_plans_by_source(source, max_pages=max_pages))
+        try:
+            pooled_entries.extend(_fetch_insurance_plans_by_source(source, max_pages=max_pages))
+        except HTTPException as exc:
+            if exc.status_code == 502:
+                skipped_sources.append(source)
+                continue
+            raise
 
     # De-duplicate by InsurancePlan id before applying requested filters.
     deduped_by_id: Dict[str, Dict[str, Any]] = {}
@@ -270,5 +301,6 @@ def fetch_kentucky_medicaid_insurance_plans(
         query_mode=query_mode,
         total_insurance_plans=len(entries),
         sources=sources,
+        skipped_sources=skipped_sources,
         entries=entries if include_entries else None,
     )
