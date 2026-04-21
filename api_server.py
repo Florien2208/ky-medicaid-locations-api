@@ -22,7 +22,8 @@ BASE_URL = "https://prod.api.centene.com/fhir/providerdirectory"
 
 class FetchResponse(BaseModel):
     run_at: str = Field(description="ISO timestamp when fetch ran")
-    total_ky_locations: int = Field(description="Count of Kentucky locations returned")
+    state: str = Field(description="State filter applied to Location search")
+    total_locations: int = Field(description="Count of locations returned for selected state")
     sources: List[str] = Field(description="Unique meta.source values from entries")
     entries: Optional[List[Dict[str, Any]]] = Field(
         default=None,
@@ -98,11 +99,13 @@ def _get(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = N
     )
 
 
-def _fetch_all_ky_locations(count_per_page: int = 200, max_pages: Optional[int] = None) -> List[Dict[str, Any]]:
+def _fetch_locations_by_state(
+    state: str, count_per_page: int = 200, max_pages: Optional[int] = None
+) -> List[Dict[str, Any]]:
     headers = {"Authorization": _auth_header(), "Accept": "application/fhir+json"}
     entries: List[Dict[str, Any]] = []
     current_url: Optional[str] = f"{BASE_URL}/Location"
-    current_params: Optional[Dict[str, Any]] = {"address-state": "KY", "_count": count_per_page}
+    current_params: Optional[Dict[str, Any]] = {"address-state": state, "_count": count_per_page}
 
     page = 1
     while current_url:
@@ -198,6 +201,12 @@ def health_check() -> Dict[str, str]:
     summary="Fetch Kentucky locations",
 )
 def fetch_ky_locations(
+    state: str = Query(
+        default="KY",
+        min_length=2,
+        max_length=2,
+        description="2-letter state code for Location search (default KY).",
+    ),
     include_entries: bool = Query(
         default=False,
         description="When true, include full raw entries in response.",
@@ -208,7 +217,8 @@ def fetch_ky_locations(
         description="Page limit for reliability in deployment (default 1).",
     ),
 ) -> FetchResponse:
-    entries = _fetch_all_ky_locations(max_pages=max_pages)
+    selected_state = state.upper()
+    entries = _fetch_locations_by_state(selected_state, max_pages=max_pages)
     sources = sorted(
         {
             entry.get("resource", {}).get("meta", {}).get("source", "?")
@@ -217,7 +227,8 @@ def fetch_ky_locations(
     )
     return FetchResponse(
         run_at=datetime.utcnow().isoformat() + "Z",
-        total_ky_locations=len(entries),
+        state=selected_state,
+        total_locations=len(entries),
         sources=sources,
         entries=entries if include_entries else None,
     )
@@ -254,7 +265,7 @@ def fetch_kentucky_medicaid_insurance_plans(
     validated_plan_type_text = _validate_filter_value(plan_type_text, "plan-type:text")
 
     # Reliable strategy: Kentucky scope comes from KY locations, then plans are filtered by type/name.
-    ky_location_entries = _fetch_all_ky_locations(max_pages=max_pages)
+    ky_location_entries = _fetch_locations_by_state("KY", max_pages=max_pages)
     ky_sources = {
         entry.get("resource", {}).get("meta", {}).get("source")
         for entry in ky_location_entries

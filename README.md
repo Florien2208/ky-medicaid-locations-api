@@ -73,6 +73,76 @@ http://localhost:8000/docs
   - `sources`
 - Add `?include_entries=true` to include raw FHIR entries.
 
+## Simple API Testing Guide
+
+Use these steps to quickly test the APIs, especially filter parameters.
+
+1. Start the server:
+```bash
+uvicorn api_server:app --host 0.0.0.0 --port 8000
+```
+2. Open Swagger UI:
+```bash
+http://localhost:8000/docs
+```
+3. In Swagger:
+   - Expand an endpoint
+   - Click **Try it out**
+   - Set parameters
+   - Click **Execute**
+
+### Endpoints to test
+
+- `GET /`  
+  Health check.
+- `GET /centene/ky-locations`  
+  Pull Kentucky locations.
+- `GET /centene/insurance-plans/kentucky-medicaid`  
+  Pull InsurancePlan results using filters.
+
+### Quick test URLs (browser or curl)
+
+```bash
+# Health check
+curl "http://localhost:8000/"
+
+# KY locations (first page only)
+curl "http://localhost:8000/centene/ky-locations?max_pages=1"
+
+# KY locations with raw entries
+curl "http://localhost:8000/centene/ky-locations?max_pages=1&include_entries=true"
+```
+
+### Filter testing (important)
+
+`/centene/insurance-plans/kentucky-medicaid` supports:
+- `name:contains` (default: `Kentucky`)
+- `plan-type:text` (default: `Medicaid`)
+
+Use URL-encoded parameter names:
+- `name:contains` -> `name%3Acontains`
+- `plan-type:text` -> `plan-type%3Atext`
+
+Examples:
+
+```bash
+# Default filter (Kentucky + Medicaid)
+curl "http://localhost:8000/centene/insurance-plans/kentucky-medicaid?name%3Acontains=Kentucky&plan-type%3Atext=Medicaid&max_pages=1"
+
+# Different name filter
+curl "http://localhost:8000/centene/insurance-plans/kentucky-medicaid?name%3Acontains=Health&plan-type%3Atext=Medicaid&max_pages=1"
+
+# Include full entries while testing filters
+curl "http://localhost:8000/centene/insurance-plans/kentucky-medicaid?name%3Acontains=Kentucky&plan-type%3Atext=Medicaid&include_entries=true&max_pages=1"
+```
+
+### Notes for filter values
+
+- Allowed characters: letters, numbers, spaces, hyphens
+- Max length: 80 characters
+- Empty values are rejected
+- Invalid values return `422` with validation details
+
 ### Deploy (easy option: Render)
 
 1. Push this folder to a GitHub repo.
