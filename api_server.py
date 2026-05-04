@@ -8,12 +8,17 @@ import os
 import re
 import time
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
+
+from anthem_client import AnthemConfig, AnthemFHIRClient
+from humana_client import HumanaConfig, HumanaFHIRClient
+from uhc_flex_client import UhcFlexConfig, UhcFlexFHIRClient
 
 load_dotenv()
 
@@ -192,6 +197,238 @@ def _fetch_insurance_plans_by_source(
 @app.get("/", tags=["Health"])
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
+
+class AnthemFetchResponse(BaseModel):
+    run_at: str = Field(description="ISO timestamp when fetch ran")
+    resource_type: str = Field(description="FHIR resource type fetched")
+    total_entries: int = Field(description="Count of bundle entries returned")
+    entries: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Raw FHIR bundle entries (only included when include_entries=true)",
+    )
+
+
+class AnthemResourceType(str, Enum):
+    InsurancePlan = "InsurancePlan"
+    Practitioner = "Practitioner"
+    PractitionerRole = "PractitionerRole"
+    Organization = "Organization"
+    OrganizationAffiliation = "OrganizationAffiliation"
+    Location = "Location"
+    HealthcareService = "HealthcareService"
+
+
+class HumanaResourceType(str, Enum):
+    InsurancePlan = "InsurancePlan"
+    Practitioner = "Practitioner"
+    PractitionerRole = "PractitionerRole"
+    Organization = "Organization"
+    Location = "Location"
+
+
+class UhcFlexResourceType(str, Enum):
+    Organization = "Organization"
+    OrganizationAffiliation = "OrganizationAffiliation"
+    Practitioner = "Practitioner"
+    PractitionerRole = "PractitionerRole"
+    Network = "Network"
+    Endpoint = "Endpoint"
+    HealthcareService = "HealthcareService"
+    InsurancePlan = "InsurancePlan"
+    Location = "Location"
+
+
+def _anthem_client() -> AnthemFHIRClient:
+    try:
+        cfg = AnthemConfig.from_env()
+        return AnthemFHIRClient(cfg)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Anthem API not configured. Set ANTHEM_TOKEN_URL, ANTHEM_CLIENT_ID, "
+                "ANTHEM_CLIENT_SECRET (and optionally ANTHEM_FHIR_BASE_URL). "
+                f"Details: {exc}"
+            ),
+        ) from exc
+
+
+@app.get(
+    "/anthem/provider-directory/{resource_type}",
+    response_model=AnthemFetchResponse,
+    tags=["Anthem (Elevance Health)"],
+    summary="Fetch Anthem Provider Directory resource entries",
+)
+def fetch_anthem_provider_directory(
+    resource_type: AnthemResourceType,
+    state: Optional[str] = Query(
+        default=None,
+        min_length=2,
+        max_length=2,
+        description="2-letter state code applied as address-state for Location searches.",
+    ),
+    include_entries: bool = Query(
+        default=False,
+        description="When true, include full raw entries in response.",
+    ),
+    max_pages: Optional[int] = Query(
+        default=1,
+        ge=1,
+        description="Page limit for reliability in deployment (default 1).",
+    ),
+) -> AnthemFetchResponse:
+    params: Dict[str, Any] = {}
+    if state:
+        if resource_type != AnthemResourceType.Location:
+            raise HTTPException(status_code=422, detail="state filter is only supported for Location resource_type.")
+        params["address-state"] = state.upper()
+
+    client = _anthem_client()
+    try:
+        entries = client.iter_entries(resource_type.value, params=params, max_pages=max_pages)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 502
+        text = exc.response.text[:200] if exc.response is not None else str(exc)
+        raise HTTPException(status_code=502, detail=f"Anthem API error {status}: {text}") from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Network error while calling Anthem API: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Unexpected error while calling Anthem API: {exc}") from exc
+
+    return AnthemFetchResponse(
+        run_at=datetime.utcnow().isoformat() + "Z",
+        resource_type=resource_type.value,
+        total_entries=len(entries),
+        entries=entries if include_entries else None,
+    )
+
+
+@app.get(
+    "/humana/provider-directory/{resource_type}",
+    response_model=AnthemFetchResponse,
+    tags=["Humana"],
+    summary="Fetch Humana public Provider Directory resource entries (no auth)",
+)
+def fetch_humana_provider_directory(
+    resource_type: HumanaResourceType,
+    sandbox: bool = Query(
+        default=False,
+        description="When true, use Humana sandbox base URL instead of production.",
+    ),
+    state: Optional[str] = Query(
+        default=None,
+        min_length=2,
+        max_length=2,
+        description="2-letter state code applied as address-state for Location searches.",
+    ),
+    include_entries: bool = Query(
+        default=False,
+        description="When true, include full raw entries in response.",
+    ),
+    max_pages: Optional[int] = Query(
+        default=1,
+        ge=1,
+        description="Page limit for reliability in deployment (default 1).",
+    ),
+) -> AnthemFetchResponse:
+    params: Dict[str, Any] = {}
+    if state:
+        if resource_type != HumanaResourceType.Location:
+            raise HTTPException(status_code=422, detail="state filter is only supported for Location resource_type.")
+        params["address-state"] = state.upper()
+
+    client = HumanaFHIRClient(HumanaConfig.sandbox() if sandbox else HumanaConfig.production())
+    try:
+        entries = client.iter_entries(resource_type.value, params=params, max_pages=max_pages)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 502
+        text = exc.response.text[:200] if exc.response is not None else str(exc)
+        raise HTTPException(status_code=502, detail=f"Humana API error {status}: {text}") from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Network error while calling Humana API: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Unexpected error while calling Humana API: {exc}") from exc
+
+    return AnthemFetchResponse(
+        run_at=datetime.utcnow().isoformat() + "Z",
+        resource_type=resource_type.value,
+        total_entries=len(entries),
+        entries=entries if include_entries else None,
+    )
+
+
+@app.get(
+    "/uhc-flex/provider-directory/{resource_type}",
+    response_model=AnthemFetchResponse,
+    tags=["UnitedHealthcare (Optum FLEX)"],
+    summary="Fetch UnitedHealthcare public Provider Directory resources (Optum FLEX)",
+)
+def fetch_uhc_flex_provider_directory(
+    resource_type: UhcFlexResourceType,
+    payer_id: str = Query(
+        default="hsid",
+        min_length=2,
+        max_length=20,
+        description="Optum FLEX payer id used in https://[payer].fhir.flex.optum.com/ (default hsid).",
+    ),
+    use_public_sandbox: bool = Query(
+        default=False,
+        description="When true, use public stage sandbox base URL (may not resolve in some networks).",
+    ),
+    state: Optional[str] = Query(
+        default=None,
+        min_length=2,
+        max_length=2,
+        description="2-letter state code applied as address-state for Location searches.",
+    ),
+    include_entries: bool = Query(
+        default=False,
+        description="When true, include full raw entries in response.",
+    ),
+    max_pages: Optional[int] = Query(
+        default=1,
+        ge=1,
+        description="Page limit for reliability in deployment (default 1).",
+    ),
+) -> AnthemFetchResponse:
+    params: Dict[str, Any] = {}
+    if state:
+        if resource_type != UhcFlexResourceType.Location:
+            raise HTTPException(status_code=422, detail="state filter is only supported for Location resource_type.")
+        params["address-state"] = state.upper()
+
+    if use_public_sandbox:
+        cfg = UhcFlexConfig.public_sandbox()
+    else:
+        # Prefer env-configured OAuth/bearer options, but allow payer_id override for base URL.
+        env_cfg = UhcFlexConfig.from_env()
+        cfg = UhcFlexConfig(
+            base_url=f"https://{payer_id}.fhir.flex.optum.com/R4/",
+            bearer_token=env_cfg.bearer_token,
+            token_url=env_cfg.token_url,
+            client_id=env_cfg.client_id,
+            client_secret=env_cfg.client_secret,
+            scope=env_cfg.scope,
+        )
+    client = UhcFlexFHIRClient(cfg)
+
+    try:
+        entries = client.iter_entries(resource_type.value, params=params, max_pages=max_pages)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 502
+        text = exc.response.text[:200] if exc.response is not None else str(exc)
+        raise HTTPException(status_code=502, detail=f"UHC FLEX API error {status}: {text}") from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Network error while calling UHC FLEX API: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Unexpected error while calling UHC FLEX API: {exc}") from exc
+
+    return AnthemFetchResponse(
+        run_at=datetime.utcnow().isoformat() + "Z",
+        resource_type=resource_type.value,
+        total_entries=len(entries),
+        entries=entries if include_entries else None,
+    )
 
 
 @app.get(
