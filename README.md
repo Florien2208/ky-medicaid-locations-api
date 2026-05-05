@@ -102,6 +102,8 @@ http://localhost:8000/docs
   Fetch Humana public Provider Directory resources (no auth).
 - `GET /uhc-flex/provider-directory/{resource_type}`  
   Fetch UnitedHealthcare public Provider Directory resources via Optum FLEX.
+- `GET /caresource/provider-directory/{resource_type}`  
+  Fetch CareSource Provider Directory resources (requires configuration after registration).
 
 ### Quick test URLs (browser or curl)
 
@@ -123,6 +125,9 @@ curl "http://localhost:8000/humana/provider-directory/Location?state=IN&max_page
 
 # UHC / Optum FLEX: pull 1 page of Indiana Locations (payer_id=hsid)
 curl "http://localhost:8000/uhc-flex/provider-directory/Location?payer_id=hsid&state=IN&max_pages=1"
+
+# CareSource: requires CARESOURCE_FHIR_BASE_URL (+ auth). Example (Location, Indiana):
+curl "http://localhost:8000/caresource/provider-directory/Location?state=IN&max_pages=1"
 ```
 
 ### Filter testing (important)
@@ -234,6 +239,16 @@ Bounded pull (defaults to `--max-pages 5`):
 ```bash
 python uhc_flex_pull.py --payer-id hsid --max-pages 2
 ```
+
+## CareSource setup
+
+CareSource confirms SMART on FHIR is used for **member authorization** and that provider directory data can be accessed by third parties, but the **FHIR base URL is provided after registration**.
+
+After CareSource registration, set in `.env`:
+- `CARESOURCE_FHIR_BASE_URL`
+- plus either:
+  - `CARESOURCE_BEARER_TOKEN`, or
+  - `CARESOURCE_TOKEN_URL`, `CARESOURCE_CLIENT_ID`, `CARESOURCE_CLIENT_SECRET` (and optionally `CARESOURCE_SCOPE`)
 
 ## Usage Notes
 

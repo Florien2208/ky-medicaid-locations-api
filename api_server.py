@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from anthem_client import AnthemConfig, AnthemFHIRClient
 from humana_client import HumanaConfig, HumanaFHIRClient
 from uhc_flex_client import UhcFlexConfig, UhcFlexFHIRClient
+from caresource_client import CareSourceConfig, CareSourceFHIRClient
 
 load_dotenv()
 
@@ -198,6 +199,14 @@ def _fetch_insurance_plans_by_source(
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
 
+@app.get("/routes", tags=["Health"])
+def list_routes() -> Dict[str, List[str]]:
+    return {
+        "paths": sorted(
+            {getattr(r, "path", "") for r in app.routes if getattr(r, "path", "")}
+        )
+    }
+
 class AnthemFetchResponse(BaseModel):
     run_at: str = Field(description="ISO timestamp when fetch ran")
     resource_type: str = Field(description="FHIR resource type fetched")
@@ -236,6 +245,15 @@ class UhcFlexResourceType(str, Enum):
     HealthcareService = "HealthcareService"
     InsurancePlan = "InsurancePlan"
     Location = "Location"
+
+class CareSourceResourceType(str, Enum):
+    InsurancePlan = "InsurancePlan"
+    Practitioner = "Practitioner"
+    PractitionerRole = "PractitionerRole"
+    Organization = "Organization"
+    OrganizationAffiliation = "OrganizationAffiliation"
+    Location = "Location"
+    HealthcareService = "HealthcareService"
 
 
 def _anthem_client() -> AnthemFHIRClient:
@@ -416,12 +434,79 @@ def fetch_uhc_flex_provider_directory(
         entries = client.iter_entries(resource_type.value, params=params, max_pages=max_pages)
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else 502
-        text = exc.response.text[:200] if exc.response is not None else str(exc)
-        raise HTTPException(status_code=502, detail=f"UHC FLEX API error {status}: {text}") from exc
+        text = exc.response.text[:400] if exc.response is not None else str(exc)
+        hint = ""
+        if status in (401, 403):
+            hint = (
+                " Hint: FLEX directory endpoints typically require OAuth2 client_credentials (or a bearer token) "
+                "with public/*.read scopes. Configure UHC_FLEX_BEARER_TOKEN, or UHC_FLEX_TOKEN_URL + "
+                "UHC_FLEX_CLIENT_ID + UHC_FLEX_CLIENT_SECRET (+ UHC_FLEX_SCOPE)."
+            )
+        raise HTTPException(status_code=status, detail=f"UHC FLEX API error {status}: {text}{hint}") from exc
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Network error while calling UHC FLEX API: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Unexpected error while calling UHC FLEX API: {exc}") from exc
+
+    return AnthemFetchResponse(
+        run_at=datetime.utcnow().isoformat() + "Z",
+        resource_type=resource_type.value,
+        total_entries=len(entries),
+        entries=entries if include_entries else None,
+    )
+
+@app.get(
+    "/caresource/provider-directory/{resource_type}",
+    response_model=AnthemFetchResponse,
+    tags=["CareSource"],
+    summary="Fetch CareSource Provider Directory resources (config required)",
+)
+def fetch_caresource_provider_directory(
+    resource_type: CareSourceResourceType,
+    state: Optional[str] = Query(
+        default=None,
+        min_length=2,
+        max_length=2,
+        description="2-letter state code applied as address-state for Location searches.",
+    ),
+    include_entries: bool = Query(
+        default=False,
+        description="When true, include full raw entries in response.",
+    ),
+    max_pages: Optional[int] = Query(
+        default=1,
+        ge=1,
+        description="Page limit for reliability in deployment (default 1).",
+    ),
+) -> AnthemFetchResponse:
+    params: Dict[str, Any] = {}
+    if state:
+        if resource_type != CareSourceResourceType.Location:
+            raise HTTPException(status_code=422, detail="state filter is only supported for Location resource_type.")
+        params["address-state"] = state.upper()
+
+    try:
+        client = CareSourceFHIRClient(CareSourceConfig.from_env())
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "CareSource API not configured. Set CARESOURCE_FHIR_BASE_URL and either CARESOURCE_BEARER_TOKEN "
+                "or CARESOURCE_TOKEN_URL + CARESOURCE_CLIENT_ID + CARESOURCE_CLIENT_SECRET (+ CARESOURCE_SCOPE). "
+                f"Details: {exc}"
+            ),
+        ) from exc
+
+    try:
+        entries = client.iter_entries(resource_type.value, params=params, max_pages=max_pages)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 502
+        text = exc.response.text[:400] if exc.response is not None else str(exc)
+        raise HTTPException(status_code=status, detail=f"CareSource API error {status}: {text}") from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Network error while calling CareSource API: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Unexpected error while calling CareSource API: {exc}") from exc
 
     return AnthemFetchResponse(
         run_at=datetime.utcnow().isoformat() + "Z",
