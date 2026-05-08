@@ -54,8 +54,11 @@ class InsurancePlanFilterResponse(BaseModel):
 
 
 app = FastAPI(
-    title="Centene KY Locations API",
-    description="Fetches Kentucky Location resources from Centene Provider Directory.",
+    title="Provider Directory API",
+    description=(
+        "Unified API for querying payer Provider Directory FHIR resources with "
+        "optional state-based filtering."
+    ),
     version="1.0.0",
 )
 
@@ -195,11 +198,11 @@ def _fetch_insurance_plans_by_source(
     return entries
 
 
-@app.get("/", tags=["Health"])
+# @app.get("/", tags=["Health"])
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
 
-@app.get("/routes", tags=["Health"])
+# @app.get("/routes", tags=["Health"])
 def list_routes() -> Dict[str, List[str]]:
     return {
         "paths": sorted(
@@ -275,7 +278,7 @@ def _anthem_client() -> AnthemFHIRClient:
     "/anthem/provider-directory/{resource_type}",
     response_model=AnthemFetchResponse,
     tags=["Anthem (Elevance Health)"],
-    summary="Fetch Anthem Provider Directory resource entries",
+    summary="Fetch Anthem Provider Directory FHIR resources",
 )
 def fetch_anthem_provider_directory(
     resource_type: AnthemResourceType,
@@ -283,7 +286,11 @@ def fetch_anthem_provider_directory(
         default=None,
         min_length=2,
         max_length=2,
-        description="2-letter state code applied as address-state for Location searches.",
+        description=(
+            "2-letter state code (e.g., KY, IN). For Location, applied as "
+            "address-state; for InsurancePlan and HealthcareService, applied as "
+            "name query using full state name when available."
+        ),
     ),
     include_entries: bool = Query(
         default=False,
@@ -292,14 +299,31 @@ def fetch_anthem_provider_directory(
     max_pages: Optional[int] = Query(
         default=1,
         ge=1,
-        description="Page limit for reliability in deployment (default 1).",
+        description="Maximum number of paginated FHIR bundle pages to fetch (default 1).",
     ),
 ) -> AnthemFetchResponse:
     params: Dict[str, Any] = {}
     if state:
-        if resource_type != AnthemResourceType.Location:
-            raise HTTPException(status_code=422, detail="state filter is only supported for Location resource_type.")
-        params["address-state"] = state.upper()
+        s = state.upper()
+        state_name_map = {
+            "KY": "Kentucky",
+            "IN": "Indiana",
+            "TN": "Tennessee",
+            "OH": "Ohio",
+        }
+        state_search_value = state_name_map.get(s, s)
+        if resource_type == AnthemResourceType.Location:
+            params["address-state"] = s
+        elif resource_type in {
+            AnthemResourceType.InsurancePlan,
+            AnthemResourceType.HealthcareService,
+        }:
+            params["name"] = state_search_value
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="state filter is only supported for Location, InsurancePlan, and HealthcareService resource types.",
+            )
 
     client = _anthem_client()
     try:
@@ -321,12 +345,12 @@ def fetch_anthem_provider_directory(
     )
 
 
-@app.get(
-    "/humana/provider-directory/{resource_type}",
-    response_model=AnthemFetchResponse,
-    tags=["Humana"],
-    summary="Fetch Humana public Provider Directory resource entries (no auth)",
-)
+# @app.get(
+#     "/humana/provider-directory/{resource_type}",
+#     response_model=AnthemFetchResponse,
+#     tags=["Humana"],
+#     summary="Fetch Humana public Provider Directory resource entries (no auth)",
+# )
 def fetch_humana_provider_directory(
     resource_type: HumanaResourceType,
     sandbox: bool = Query(
@@ -337,7 +361,7 @@ def fetch_humana_provider_directory(
         default=None,
         min_length=2,
         max_length=2,
-        description="2-letter state code applied as address-state for Location searches.",
+        description="2-letter state code. For Location, mapped to address-state; for InsurancePlan, mapped to name:contains (full state name).",
     ),
     include_entries: bool = Query(
         default=False,
@@ -351,9 +375,18 @@ def fetch_humana_provider_directory(
 ) -> AnthemFetchResponse:
     params: Dict[str, Any] = {}
     if state:
-        if resource_type != HumanaResourceType.Location:
-            raise HTTPException(status_code=422, detail="state filter is only supported for Location resource_type.")
-        params["address-state"] = state.upper()
+        s = state.upper()
+        if resource_type == HumanaResourceType.Location:
+            params["address-state"] = s
+        elif resource_type == HumanaResourceType.InsurancePlan:
+            state_name_map = {
+                "KY": "Kentucky",
+                "IN": "Indiana",
+                "TN": "Tennessee",
+                "OH": "Ohio",
+            }
+            name_contains = state_name_map.get(s, s)
+            params["name"] = name_contains
 
     client = HumanaFHIRClient(HumanaConfig.sandbox() if sandbox else HumanaConfig.production())
     try:
@@ -375,12 +408,12 @@ def fetch_humana_provider_directory(
     )
 
 
-@app.get(
-    "/uhc-flex/provider-directory/{resource_type}",
-    response_model=AnthemFetchResponse,
-    tags=["UnitedHealthcare (Optum FLEX)"],
-    summary="Fetch UnitedHealthcare public Provider Directory resources (Optum FLEX)",
-)
+# @app.get(
+#     "/uhc-flex/provider-directory/{resource_type}",
+#     response_model=AnthemFetchResponse,
+#     tags=["UnitedHealthcare (Optum FLEX)"],
+#     summary="Fetch UnitedHealthcare public Provider Directory resources (Optum FLEX)",
+# )
 def fetch_uhc_flex_provider_directory(
     resource_type: UhcFlexResourceType,
     payer_id: str = Query(
@@ -455,12 +488,12 @@ def fetch_uhc_flex_provider_directory(
         entries=entries if include_entries else None,
     )
 
-@app.get(
-    "/caresource/provider-directory/{resource_type}",
-    response_model=AnthemFetchResponse,
-    tags=["CareSource"],
-    summary="Fetch CareSource Provider Directory resources (config required)",
-)
+# @app.get(
+#     "/caresource/provider-directory/{resource_type}",
+#     response_model=AnthemFetchResponse,
+#     tags=["CareSource"],
+#     summary="Fetch CareSource Provider Directory resources (config required)",
+# )
 def fetch_caresource_provider_directory(
     resource_type: CareSourceResourceType,
     state: Optional[str] = Query(
@@ -516,12 +549,12 @@ def fetch_caresource_provider_directory(
     )
 
 
-@app.get(
-    "/centene/ky-locations",
-    response_model=FetchResponse,
-    tags=["Centene"],
-    summary="Fetch Kentucky locations",
-)
+# @app.get(
+#     "/centene/ky-locations",
+#     response_model=FetchResponse,
+#     tags=["Centene"],
+#     summary="Fetch Kentucky locations",
+# )
 def fetch_ky_locations(
     state: str = Query(
         default="KY",
@@ -556,12 +589,12 @@ def fetch_ky_locations(
     )
 
 
-@app.get(
-    "/centene/insurance-plans/kentucky-medicaid",
-    response_model=InsurancePlanFilterResponse,
-    tags=["Centene"],
-    summary="Fetch InsurancePlan by Kentucky + Medicaid filter",
-)
+# @app.get(
+#     "/centene/insurance-plans/kentucky-medicaid",
+#     response_model=InsurancePlanFilterResponse,
+#     tags=["Centene"],
+#     summary="Fetch InsurancePlan by Kentucky + Medicaid filter",
+# )
 def fetch_kentucky_medicaid_insurance_plans(
     name_contains: str = Query(
         default="Kentucky",
