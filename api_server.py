@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 from anthem_client import AnthemConfig, AnthemFHIRClient
@@ -60,6 +60,11 @@ app = FastAPI(
         "optional state-based filtering."
     ),
     version="1.0.0",
+    swagger_ui_parameters={
+        # Keep Swagger UI stable for very large JSON responses by disabling
+        # syntax highlighting (common source of call stack overflows).
+        "syntaxHighlight": {"activated": False},
+    },
 )
 
 
@@ -198,6 +203,108 @@ def _fetch_insurance_plans_by_source(
     return entries
 
 
+def _dedupe_entries_by_resource_id(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: Dict[str, Dict[str, Any]] = {}
+    fallback: List[Dict[str, Any]] = []
+    for entry in entries:
+        resource = entry.get("resource", {})
+        resource_type = resource.get("resourceType")
+        resource_id = resource.get("id")
+        if resource_type and resource_id:
+            deduped[f"{resource_type}:{resource_id}"] = entry
+        else:
+            fallback.append(entry)
+    return list(deduped.values()) + fallback
+
+
+def _insurance_plan_matches_state(
+    entry: Dict[str, Any],
+    state_code: str,
+    state_name: str,
+    location_ids: Optional[set] = None,
+) -> bool:
+    resource = entry.get("resource", {})
+    for area in resource.get("coverageArea", []):
+        display = (area.get("display") or "").strip().upper()
+        if display in {state_code, state_name.upper()}:
+            return True
+
+        reference = (area.get("reference") or "").strip()
+        if location_ids:
+            loc_id = _extract_location_id(reference)
+            if loc_id and loc_id in location_ids:
+                return True
+    return False
+
+
+def _extract_location_id(reference: str) -> Optional[str]:
+    if not reference:
+        return None
+
+    ref = reference.strip()
+    # Relative format: Location/{id}
+    if ref.startswith("Location/"):
+        return ref.split("/", 1)[1]
+
+    # Absolute/compound formats:
+    # .../Location/{id}, .../Location/{id}/_history/{ver}, urn:uuid:...
+    match = re.search(r"/Location/([^/?#]+)", ref)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def _resource_references_location(resource: Any, location_ids: set) -> bool:
+    if isinstance(resource, dict):
+        ref = resource.get("reference")
+        if isinstance(ref, str):
+            loc_id = _extract_location_id(ref)
+            if loc_id in location_ids:
+                return True
+        for value in resource.values():
+            if _resource_references_location(value, location_ids):
+                return True
+        return False
+
+    if isinstance(resource, list):
+        for item in resource:
+            if _resource_references_location(item, location_ids):
+                return True
+        return False
+
+    return False
+
+
+def _entry_matches_state_generic(
+    entry: Dict[str, Any],
+    state_code: str,
+    state_name: str,
+    location_ids: Optional[set] = None,
+) -> bool:
+    resource = entry.get("resource", {})
+    target_values = {state_code.upper(), state_name.upper()}
+
+    raw_address = resource.get("address", [])
+    address_list = raw_address if isinstance(raw_address, list) else [raw_address]
+    for address in address_list:
+        if not isinstance(address, dict):
+            continue
+        address_state = (address.get("state") or "").strip().upper()
+        if address_state in target_values:
+            return True
+
+    for area in resource.get("coverageArea", []):
+        display = (area.get("display") or "").strip().upper()
+        if display in target_values:
+            return True
+
+    if location_ids and _resource_references_location(resource, location_ids):
+        return True
+
+    return False
+
+
 # @app.get("/", tags=["Health"])
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
@@ -218,6 +325,13 @@ class AnthemFetchResponse(BaseModel):
         default=None,
         description="Raw FHIR bundle entries (only included when include_entries=true)",
     )
+
+
+class AnthemByIdResponse(BaseModel):
+    run_at: str = Field(description="ISO timestamp when fetch ran")
+    resource_type: str = Field(description="FHIR resource type fetched")
+    resource_id: str = Field(description="FHIR resource id requested")
+    entry: Dict[str, Any] = Field(description="Single FHIR entry/resource payload")
 
 
 class AnthemResourceType(str, Enum):
@@ -259,6 +373,37 @@ class CareSourceResourceType(str, Enum):
     HealthcareService = "HealthcareService"
 
 
+def _anthem_state_query_candidates(resource_type: AnthemResourceType, state_code: str) -> List[Dict[str, str]]:
+    if resource_type == AnthemResourceType.Location:
+        return [{"address-state": state_code}]
+    if resource_type == AnthemResourceType.InsurancePlan:
+        return [
+            {"coverage-area.address-state": state_code},
+            {"coverage-area.state": state_code},
+        ]
+    if resource_type == AnthemResourceType.Practitioner:
+        return [{"address-state": state_code}]
+    if resource_type == AnthemResourceType.PractitionerRole:
+        return [
+            {"location.address-state": state_code},
+            {"practitioner.address-state": state_code},
+        ]
+    if resource_type == AnthemResourceType.Organization:
+        return [{"address-state": state_code}]
+    if resource_type == AnthemResourceType.OrganizationAffiliation:
+        return [
+            {"location.address-state": state_code},
+            {"participating-organization.address-state": state_code},
+            {"organization.address-state": state_code},
+        ]
+    if resource_type == AnthemResourceType.HealthcareService:
+        return [
+            {"location.address-state": state_code},
+            {"providedby.address-state": state_code},
+        ]
+    return []
+
+
 def _anthem_client() -> AnthemFHIRClient:
     try:
         cfg = AnthemConfig.from_env()
@@ -288,8 +433,8 @@ def fetch_anthem_provider_directory(
         max_length=2,
         description=(
             "2-letter state code (e.g., KY, IN). For Location, applied as "
-            "address-state; for InsurancePlan and HealthcareService, applied as "
-            "name query using full state name when available."
+            "address-state. For other resources, state-aware filtering uses "
+            "FHIR state/location relationships when available."
         ),
     ),
     include_entries: bool = Query(
@@ -302,32 +447,123 @@ def fetch_anthem_provider_directory(
         description="Maximum number of paginated FHIR bundle pages to fetch (default 1).",
     ),
 ) -> AnthemFetchResponse:
-    params: Dict[str, Any] = {}
-    if state:
-        s = state.upper()
-        state_name_map = {
-            "KY": "Kentucky",
-            "IN": "Indiana",
-            "TN": "Tennessee",
-            "OH": "Ohio",
-        }
-        state_search_value = state_name_map.get(s, s)
-        if resource_type == AnthemResourceType.Location:
-            params["address-state"] = s
-        elif resource_type in {
-            AnthemResourceType.InsurancePlan,
-            AnthemResourceType.HealthcareService,
-        }:
-            params["name"] = state_search_value
-        else:
-            raise HTTPException(
-                status_code=422,
-                detail="state filter is only supported for Location, InsurancePlan, and HealthcareService resource types.",
-            )
-
     client = _anthem_client()
     try:
-        entries = client.iter_entries(resource_type.value, params=params, max_pages=max_pages)
+        if not state:
+            entries = client.iter_entries(resource_type.value, params={}, max_pages=max_pages)
+        else:
+            s = state.upper()
+            state_name_map = {
+                "KY": "Kentucky",
+                "IN": "Indiana",
+                "TN": "Tennessee",
+                "OH": "Ohio",
+            }
+            state_search_value = state_name_map.get(s, s)
+            state_location_ids: Optional[set] = None
+
+            entries: List[Dict[str, Any]] = []
+            candidates = _anthem_state_query_candidates(resource_type, s)
+            last_http_error: Optional[requests.HTTPError] = None
+
+            # Resource-specific server-side filtering first (valid FHIR way).
+            for candidate_params in candidates:
+                try:
+                    candidate_entries = client.iter_entries(
+                        resource_type.value,
+                        params=candidate_params,
+                        max_pages=max_pages,
+                    )
+                    if resource_type == AnthemResourceType.InsurancePlan:
+                        if state_location_ids is None:
+                            state_locations = client.iter_entries(
+                                "Location",
+                                params={"address-state": s},
+                                max_pages=max_pages,
+                            )
+                            state_location_ids = {
+                                entry.get("resource", {}).get("id")
+                                for entry in state_locations
+                                if entry.get("resource", {}).get("id")
+                            }
+                        candidate_entries = [
+                            entry
+                            for entry in candidate_entries
+                            if _insurance_plan_matches_state(entry, s, state_search_value, state_location_ids)
+                        ]
+                    if candidate_entries:
+                        entries = candidate_entries
+                        break
+                except requests.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else 502
+                    # Unsupported search params are common between payer implementations.
+                    # Try the next candidate for this resource type.
+                    if status in (400, 404, 422):
+                        last_http_error = exc
+                        continue
+                    raise
+
+            if not entries and resource_type == AnthemResourceType.InsurancePlan:
+                # Some payer implementations return HTTP 200 + empty for chain params
+                # even when state-relevant plans exist. Use a bounded fallback fetch
+                # (single resource scan, no per-location fanout) to avoid zero false negatives.
+                fallback_pages = max_pages if max_pages is not None else 1
+                fallback_pages = max(1, min(fallback_pages, 3))
+                unfiltered_entries = client.iter_entries(
+                    resource_type.value,
+                    params={},
+                    max_pages=fallback_pages,
+                )
+                if state_location_ids is None:
+                    state_locations = client.iter_entries(
+                        "Location",
+                        params={"address-state": s},
+                        max_pages=max_pages,
+                    )
+                    state_location_ids = {
+                        entry.get("resource", {}).get("id")
+                        for entry in state_locations
+                        if entry.get("resource", {}).get("id")
+                    }
+                entries = [
+                    entry
+                    for entry in unfiltered_entries
+                    if _insurance_plan_matches_state(entry, s, state_search_value, state_location_ids)
+                ]
+
+            if not entries and resource_type != AnthemResourceType.InsurancePlan:
+                # Fallback path: fetch resource once and apply state relationship filter locally.
+                # This keeps behavior correct when a payer does not support a specific chain param.
+                unfiltered_entries = client.iter_entries(resource_type.value, params={}, max_pages=max_pages)
+                state_locations = client.iter_entries(
+                    "Location",
+                    params={"address-state": s},
+                    max_pages=max_pages,
+                )
+                state_location_ids = {
+                    entry.get("resource", {}).get("id")
+                    for entry in state_locations
+                    if entry.get("resource", {}).get("id")
+                }
+
+                if resource_type == AnthemResourceType.InsurancePlan:
+                    entries = [
+                        entry
+                        for entry in unfiltered_entries
+                        if _insurance_plan_matches_state(entry, s, state_search_value, state_location_ids)
+                    ]
+                else:
+                    entries = [
+                        entry
+                        for entry in unfiltered_entries
+                        if _entry_matches_state_generic(entry, s, state_search_value, state_location_ids)
+                    ]
+
+            # Preserve original API error behavior if no fallback path can help and we only saw hard failures.
+            if not entries and last_http_error is not None:
+                status = last_http_error.response.status_code if last_http_error.response is not None else 502
+                if status >= 500:
+                    raise last_http_error
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else 502
         text = exc.response.text[:200] if exc.response is not None else str(exc)
@@ -342,6 +578,69 @@ def fetch_anthem_provider_directory(
         resource_type=resource_type.value,
         total_entries=len(entries),
         entries=entries if include_entries else None,
+    )
+
+
+@app.get(
+    "/anthem/provider-directory/{resource_type}/{resource_id}",
+    response_model=AnthemByIdResponse,
+    tags=["Anthem (Elevance Health)"],
+    summary="Fetch a single Anthem Provider Directory resource by id",
+)
+def fetch_anthem_provider_directory_by_id(
+    resource_type: AnthemResourceType,
+    resource_id: str = Path(
+        ...,
+        min_length=1,
+        description="FHIR resource id (e.g., Location/abc -> use just abc).",
+    ),
+) -> AnthemByIdResponse:
+    cleaned_id = resource_id.strip()
+    if not cleaned_id:
+        raise HTTPException(status_code=422, detail="resource_id cannot be empty.")
+    if "/" in cleaned_id or " " in cleaned_id:
+        raise HTTPException(
+            status_code=422,
+            detail="resource_id must be a raw id segment without slashes/spaces.",
+        )
+
+    client = _anthem_client()
+    try:
+        body = client._get_json(
+            f"{client._cfg.base_url.rstrip('/')}/{resource_type.value}/{cleaned_id}",
+            params=None,
+        )
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 502
+        if status == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{resource_type.value}/{cleaned_id} not found in Anthem directory.",
+            ) from exc
+        text = exc.response.text[:200] if exc.response is not None else str(exc)
+        raise HTTPException(status_code=502, detail=f"Anthem API error {status}: {text}") from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Network error while calling Anthem API: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Unexpected error while calling Anthem API: {exc}") from exc
+
+    entry: Dict[str, Any]
+    if body.get("resourceType") == "Bundle":
+        bundle_entries = body.get("entry", [])
+        if not bundle_entries:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{resource_type.value}/{cleaned_id} not found in Anthem directory.",
+            )
+        entry = bundle_entries[0]
+    else:
+        entry = {"resource": body}
+
+    return AnthemByIdResponse(
+        run_at=datetime.utcnow().isoformat() + "Z",
+        resource_type=resource_type.value,
+        resource_id=cleaned_id,
+        entry=entry,
     )
 
 

@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -116,6 +117,24 @@ class AnthemFHIRClient:
         last.raise_for_status()
         raise RuntimeError("Unreachable")
 
+    @staticmethod
+    def _entry_dedup_key(resource_type: str, entry: Dict[str, Any]) -> str:
+        """
+        Build a stable key for de-duplicating entries while preserving order.
+        Prefer resourceType/id, then fullUrl, then canonicalized entry JSON.
+        """
+        resource = entry.get("resource", {})
+        entry_resource_type = resource.get("resourceType") or resource_type
+        resource_id = resource.get("id")
+        if resource_id:
+            return f"{entry_resource_type}:{resource_id}"
+
+        full_url = entry.get("fullUrl")
+        if full_url:
+            return f"fullUrl:{full_url}"
+
+        return "raw:" + json.dumps(entry, sort_keys=True, separators=(",", ":"))
+
     def iter_entries(
         self,
         resource_type: str,
@@ -125,6 +144,7 @@ class AnthemFHIRClient:
         max_pages: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         entries: List[Dict[str, Any]] = []
+        seen_keys = set()
 
         base = self._cfg.base_url.rstrip("/") + "/"
         url: Optional[str] = f"{base}{resource_type}"
@@ -134,7 +154,12 @@ class AnthemFHIRClient:
         page = 1
         while url:
             body = self._get_json(url, params=cur_params)
-            entries.extend(body.get("entry", []))
+            for entry in body.get("entry", []):
+                dedup_key = self._entry_dedup_key(resource_type, entry)
+                if dedup_key in seen_keys:
+                    continue
+                seen_keys.add(dedup_key)
+                entries.append(entry)
 
             if max_pages is not None and page >= max_pages:
                 break
